@@ -36,6 +36,7 @@ int main()
     HRESULT hres = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "Failed to initialize COM library. Error code = 0x" << hex << hres << endl;
         return 1;
     }
@@ -53,6 +54,7 @@ int main()
         nullptr);
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "Failed to initialize security. Error code = 0x" << hex << hres << endl;
         CoUninitialize();
         return 1;
@@ -64,6 +66,7 @@ int main()
                             reinterpret_cast<LPVOID*>(& pLoc));
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "Failed to create IWbemLocator object. Error code = 0x" << hex << hres << endl;
         CoUninitialize();
         return 1;
@@ -74,6 +77,7 @@ int main()
     hres = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), nullptr, nullptr, nullptr, NULL, nullptr, nullptr, &pSvc);
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "Could not connect. Error code = 0x" << hex << hres << endl;
         pLoc->Release();
         CoUninitialize();
@@ -92,6 +96,7 @@ int main()
         EOAC_NONE);
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "Could not set proxy blanket. Error code = 0x" << hex << hres << endl;
         pSvc->Release();
         pLoc->Release();
@@ -105,6 +110,7 @@ int main()
                             reinterpret_cast<void**>(&pUnsecApp));
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "CoCreateInstance failed with error: 0x" << hex << hres << endl;
         pSvc->Release();
         pLoc->Release();
@@ -129,6 +135,7 @@ int main()
         WBEM_FLAG_SEND_STATUS, nullptr, pStubSink);
     if (FAILED(hres))
     {
+        ShowConsole();
         cout << "ExecNotificationQueryAsync failed with error: 0x" << hex << hres << endl;
         pSvc->Release();
         pLoc->Release();
