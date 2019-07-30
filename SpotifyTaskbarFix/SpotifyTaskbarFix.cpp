@@ -1,13 +1,16 @@
-#include <iostream>
+#include <chrono>
 #include <csignal>
-#include <comutil.h>
+#include <iostream>
+
 #include <Windows.h>
 #include <WbemIdl.h>
+#include <comutil.h>
 #include <tlhelp32.h>
 
 #include "EventSink.h"
 
 using namespace std;
+using namespace std::chrono;
 
 
 // ====================
@@ -16,7 +19,10 @@ using namespace std;
 
 HANDLE hMutex;
 
+HWND hConsoleWindow;
 HWND hSpotifyMainWindow;
+
+BOOL showConsole = FALSE;
 
 
 void FixSpotifyTaskbarIssue(DWORD);
@@ -24,9 +30,17 @@ RECT GetWindowPosition(HWND);
 BOOL IsSpotifyMainProcess(DWORD);
 
 
-inline void HideConsole() { ShowWindow(GetConsoleWindow(), SW_HIDE); }
-inline void ShowConsole() { ShowWindow(GetConsoleWindow(), SW_SHOW); }
-inline bool IsConsoleVisible() { return IsWindowVisible(GetConsoleWindow()) != FALSE; }
+inline void HideConsole()
+{
+    if (hConsoleWindow != nullptr)
+        ShowWindow(hConsoleWindow, SW_HIDE);
+}
+
+inline void ShowConsole()
+{
+    if (hConsoleWindow != nullptr)
+        ShowWindow(hConsoleWindow, SW_SHOW);
+}
 
 void Abort(const int signum)
 {
@@ -41,6 +55,7 @@ void Abort(const int signum)
 
 inline void ReadLine()
 {
+    ShowConsole();
     cout << "\nPress enter to continue...";
     getchar();
 }
@@ -50,9 +65,18 @@ inline void ReadLine()
 //     MAIN
 // ============
 
-int main()  // NOLINT
+int main(const int argc, char* argv[]) // NOLINT
 {
-    HideConsole();
+    // Parse arguments
+    for (int i = 0; i < argc; i++)
+    {
+        if (strcmp(argv[i], "-w") == 0)
+            showConsole = TRUE;
+    }
+
+    hConsoleWindow = GetConsoleWindow();
+    if (showConsole == FALSE)
+        HideConsole();
 
     // Signal handling
     signal(SIGABRT, Abort);
@@ -63,7 +87,6 @@ int main()  // NOLINT
     hMutex = CreateMutex(nullptr, TRUE, L"SpotifyTaskbarFix-{150F0728-6840-4C9D-B2EE-DE289EAFE29F}");
     if (GetLastError() == ERROR_ALREADY_EXISTS)
     {
-        ShowConsole();
         cout << "ERROR: Program is already running!" << endl;
         ReadLine();
         return 1;
@@ -75,7 +98,6 @@ int main()  // NOLINT
         HRESULT hres = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(hres))
         {
-            ShowConsole();
             cout << "Failed to initialize COM library. Error code = 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -96,7 +118,6 @@ int main()  // NOLINT
         {
             CoUninitialize();
 
-            ShowConsole();
             cout << "Failed to initialize security. Error code = 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -110,7 +131,6 @@ int main()  // NOLINT
         {
             CoUninitialize();
 
-            ShowConsole();
             cout << "Failed to create IWbemLocator object. Error code = 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -124,7 +144,6 @@ int main()  // NOLINT
             pLoc->Release();
             CoUninitialize();
 
-            ShowConsole();
             cout << "Could not connect. Error code = 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -146,7 +165,6 @@ int main()  // NOLINT
             pLoc->Release();
             CoUninitialize();
 
-            ShowConsole();
             cout << "Could not set proxy blanket. Error code = 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -163,7 +181,6 @@ int main()  // NOLINT
             pUnsecApp->Release();
             CoUninitialize();
 
-            ShowConsole();
             cout << "CoCreateInstance failed with error: 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -193,7 +210,6 @@ int main()  // NOLINT
             pStubSink->Release();
             CoUninitialize();
 
-            ShowConsole();
             cout << "ExecNotificationQueryAsync failed with error: 0x" << hex << hres << endl;
             ReadLine();
             return 1;
@@ -206,7 +222,6 @@ int main()  // NOLINT
     }
     catch (const std::exception& e)
     {
-        ShowConsole();
         cout << "ERROR: Unhandled exception\n    " << e.what() << endl;
         ReadLine();
         Abort(1);
@@ -220,24 +235,32 @@ int main()  // NOLINT
 
 void FixSpotifyTaskbarIssue(const DWORD processId)
 {
-    Sleep(120);
     hSpotifyMainWindow = nullptr;
+    milliseconds ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
+
+    const HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
+    WaitForInputIdle(hProcess, 1000);
+    CloseHandle(hProcess);
+
+    if (duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - ms.count() < 500)
+        Sleep(500);
+
     if (IsSpotifyMainProcess(processId) == TRUE)
     {
         const HWND hWnd = hSpotifyMainWindow;
         if (hWnd != nullptr)
         {
-            const HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
-            WaitForInputIdle(hProcess, 1000);
-            CloseHandle(hProcess);
+            printf("Spotify process started: 0x%08lX\n", processId);
 
             const RECT wPos = GetWindowPosition(hWnd);
             const SIZE wSz = {wPos.right - wPos.left, wPos.bottom - wPos.top};
             const RECT zero = {0, 0, wSz.cx, wSz.cy};
 
-            Sleep(200);
+            const auto delta = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - ms.count();
+            if (delta < 1000)
+                Sleep(1000 - delta);
+
             MoveWindow(hWnd, zero.left, zero.top, wSz.cx, wSz.cy, TRUE);
-            Sleep(50);
             MoveWindow(hWnd, wPos.left, wPos.top, wSz.cx, wSz.cy, TRUE);
         }
     }
