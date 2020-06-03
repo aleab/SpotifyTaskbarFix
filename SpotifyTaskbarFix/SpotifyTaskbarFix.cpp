@@ -1,6 +1,8 @@
 #include <chrono>
 #include <csignal>
 #include <iostream>
+#include <iomanip>
+#include <string>
 
 #include <Windows.h>
 #include <WbemIdl.h>
@@ -25,6 +27,7 @@ HWND hSpotifyMainWindow;
 BOOL showConsole = FALSE;
 
 
+const string getTime(const system_clock::time_point* const);
 void FixSpotifyTaskbarIssue(DWORD);
 RECT GetWindowPosition(HWND);
 BOOL IsSpotifyMainProcess(DWORD);
@@ -233,35 +236,70 @@ int main(const int argc, char* argv[]) // NOLINT
 //     FUNCTIONS
 // =================
 
+const string getTime(const system_clock::time_point *const tp)
+{
+    const auto time = system_clock::to_time_t(*tp);
+    struct tm ptm;
+    localtime_s(&ptm, &time);
+
+    char timeBuffer[32];
+    std::strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S", &ptm);
+
+    const auto ms = static_cast<unsigned>((tp->time_since_epoch() - duration_cast<seconds>(tp->time_since_epoch())) / milliseconds(1));
+
+    snprintf(timeBuffer, sizeof(timeBuffer), "%s.%d", timeBuffer, ms);
+    return timeBuffer;
+}
+
 void FixSpotifyTaskbarIssue(const DWORD processId)
 {
     hSpotifyMainWindow = nullptr;
-    milliseconds ms = duration_cast<milliseconds>(system_clock::now().time_since_epoch());
+    const auto startedTime = system_clock::now();
 
     const HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
     WaitForInputIdle(hProcess, 1000);
     CloseHandle(hProcess);
 
-    if (duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - ms.count() < 500)
-        Sleep(500);
+    const auto idleTime = system_clock::now();
+    const long long msToIdle = duration_cast<milliseconds>(idleTime.time_since_epoch() - startedTime.time_since_epoch()).count();
 
     if (IsSpotifyMainProcess(processId) == TRUE)
     {
         const HWND hWnd = hSpotifyMainWindow;
         if (hWnd != nullptr)
         {
-            printf("Spotify process started: 0x%08lX\n", processId);
-
             const RECT wPos = GetWindowPosition(hWnd);
             const SIZE wSz = {wPos.right - wPos.left, wPos.bottom - wPos.top};
             const RECT zero = {0, 0, wSz.cx, wSz.cy};
 
-            const auto delta = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - ms.count();
-            if (delta < 1000)
-                Sleep(1000 - delta);
+            printf("[%s] Spotify process started.\n", getTime(&startedTime).c_str());
+            printf("  | Process ID:    0x%08lX\n", processId);
+            printf("  | Window handle: 0x%08lX\n", reinterpret_cast<unsigned long>(hWnd));
+            printf("  | Window position: (%d, %d)\n", wPos.left, wPos.top);
+            printf("  | Wait for input idle: %lldms\n", msToIdle);
 
-            MoveWindow(hWnd, zero.left, zero.top, wSz.cx, wSz.cy, TRUE);
-            MoveWindow(hWnd, wPos.left, wPos.top, wSz.cx, wSz.cy, TRUE);
+            long elapsedMs = 0;
+            while ((GetWindowLongA(hWnd, GWL_STYLE) & WS_VISIBLE) == 0 && elapsedMs < 10 * 1000)
+            {
+                Sleep(100);
+                elapsedMs += 100;
+            }
+
+            //const auto delta = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - ms.count();
+            //if (delta < 1000)
+            //    Sleep(1000 - delta);
+
+            if ((GetWindowLongA(hWnd, GWL_STYLE) & WS_VISIBLE) != 0)
+            {
+                const auto visibleTime = system_clock::now();
+                printf("[%s] The window is visible.\n", getTime(&visibleTime).c_str());
+
+                MoveWindow(hWnd, zero.left, zero.top, wSz.cx, wSz.cy, TRUE);
+                MoveWindow(hWnd, wPos.left, wPos.top, wSz.cx, wSz.cy, TRUE);
+
+                const auto doneTime = system_clock::now();
+                printf("[%s] The window has been moved.\n\n", getTime(&doneTime).c_str());
+            }
         }
     }
 }
