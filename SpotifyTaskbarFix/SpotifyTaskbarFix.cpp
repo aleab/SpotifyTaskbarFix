@@ -15,24 +15,36 @@ using namespace std;
 using namespace std::chrono;
 
 
+typedef struct {
+    HWND hPWnd;
+    HWND hWnd;
+    bool isMainProcess;
+} FindSpotifyMainWindowResult;
+
+
+constexpr auto WAIT_FOR_INPUT_IDLE_TIMEOUT = 1 * 1000;
+constexpr auto FIND_SPOTIFY_WINDOW_RETRY_TIMEOUT = 5 * 1000;
+constexpr auto WINDOW_VISIBLE_TIMEOUT = 10 * 1000;
+
+
 // ====================
 //     DECLARATIONS
 // ====================
 
+// GLOBAL VARIABLES
 HANDLE hMutex;
-
 HWND hConsoleWindow;
-HWND hSpotifyMainWindow;
+bool showConsole = false;
 
-BOOL showConsole = FALSE;
-
-
-const string getTime(const system_clock::time_point* const);
+// FUNCTIONS
 void FixSpotifyTaskbarIssue(DWORD);
-RECT GetWindowPosition(HWND);
-BOOL IsSpotifyMainProcess(DWORD);
+void FindSpotifyMainWindow(const DWORD, FindSpotifyMainWindowResult* const);
 
+void GetLocalTime(const system_clock::time_point* const, char* const, size_t);
+RECT GetWindowPosition(const HWND);
+void PrintWindowStyles(const LONG, const LONG, const LONG, const LONG);
 
+// INLINE FUNCTIONS
 inline void HideConsole()
 {
     if (hConsoleWindow != nullptr)
@@ -45,7 +57,7 @@ inline void ShowConsole()
         ShowWindow(hConsoleWindow, SW_SHOW);
 }
 
-void Abort(const int signum)
+inline void Abort(const int signum)
 {
     if (hMutex != nullptr && hMutex != INVALID_HANDLE_VALUE)
     {
@@ -63,6 +75,11 @@ inline void ReadLine()
     getchar();
 }
 
+inline bool HasFlag(LONG bitfield, LONG flag)
+{
+    return (bitfield & flag) != 0;
+}
+
 
 // ============
 //     MAIN
@@ -74,11 +91,11 @@ int main(const int argc, char* argv[]) // NOLINT
     for (int i = 0; i < argc; i++)
     {
         if (strcmp(argv[i], "-w") == 0)
-            showConsole = TRUE;
+            showConsole = true;
     }
 
     hConsoleWindow = GetConsoleWindow();
-    if (showConsole == FALSE)
+    if (!showConsole)
         HideConsole();
 
     // Signal handling
@@ -218,6 +235,7 @@ int main(const int argc, char* argv[]) // NOLINT
             return 1;
         }
 
+        cout << "READY!" << endl;
         while (true)
         {
             Sleep(1500);
@@ -231,77 +249,200 @@ int main(const int argc, char* argv[]) // NOLINT
     }
 }
 
-
-// =================
-//     FUNCTIONS
-// =================
-
-const string getTime(const system_clock::time_point *const tp)
-{
-    const auto time = system_clock::to_time_t(*tp);
-    struct tm ptm;
-    localtime_s(&ptm, &time);
-
-    char timeBuffer[32];
-    std::strftime(timeBuffer, sizeof(timeBuffer), "%H:%M:%S", &ptm);
-
-    const auto ms = static_cast<unsigned>((tp->time_since_epoch() - duration_cast<seconds>(tp->time_since_epoch())) / milliseconds(1));
-
-    snprintf(timeBuffer, sizeof(timeBuffer), "%s.%d", timeBuffer, ms);
-    return timeBuffer;
-}
-
 void FixSpotifyTaskbarIssue(const DWORD processId)
 {
-    hSpotifyMainWindow = nullptr;
     const auto startedTime = system_clock::now();
 
     const HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
-    WaitForInputIdle(hProcess, 1000);
+    WaitForInputIdle(hProcess, WAIT_FOR_INPUT_IDLE_TIMEOUT);
     CloseHandle(hProcess);
 
     const auto idleTime = system_clock::now();
     const long long msToIdle = duration_cast<milliseconds>(idleTime.time_since_epoch() - startedTime.time_since_epoch()).count();
 
-    if (IsSpotifyMainProcess(processId) == TRUE)
+    if (msToIdle < 500)
+        Sleep(500);
+
+    FindSpotifyMainWindowResult spResult;
+    FindSpotifyMainWindow(processId, &spResult);
+
+    if (spResult.isMainProcess)
     {
-        const HWND hWnd = hSpotifyMainWindow;
-        if (hWnd != nullptr)
+        char localTime[32];
+        GetLocalTime(&startedTime, localTime, sizeof localTime);
+        printf("[%s] Spotify process started.\n", localTime);
+        printf("  | Process ID:    0x%08lX\n", processId);
+
+        // The main window might not be immediately available after the process starts;
+        // in case the main process is correctly identified, but it doesn't YET contain
+        // the main window, we wait for a bit and look for it again.
+
+        long ms = 0;
+        while ((spResult.hPWnd == nullptr || spResult.hWnd == nullptr) && ms < FIND_SPOTIFY_WINDOW_RETRY_TIMEOUT)
         {
-            const RECT wPos = GetWindowPosition(hWnd);
-            const SIZE wSz = {wPos.right - wPos.left, wPos.bottom - wPos.top};
-            const RECT zero = {0, 0, wSz.cx, wSz.cy};
+            Sleep(250);
+            FindSpotifyMainWindow(processId, &spResult);
+            ms += 250;
+        }
 
-            printf("[%s] Spotify process started.\n", getTime(&startedTime).c_str());
-            printf("  | Process ID:    0x%08lX\n", processId);
-            printf("  | Window handle: 0x%08lX\n", reinterpret_cast<unsigned long>(hWnd));
+        if (spResult.hPWnd != nullptr && spResult.hWnd != nullptr)
+        {
+            const RECT wPos = GetWindowPosition(spResult.hPWnd);
+            const SIZE wSz = { wPos.right - wPos.left, wPos.bottom - wPos.top };
+            const RECT zero = { 0, 0, wSz.cx, wSz.cy };
+
+            printf("  | Window handle: 0x%08lX\n", reinterpret_cast<unsigned long>(spResult.hWnd));
             printf("  | Window position: (%d, %d)\n", wPos.left, wPos.top);
-            printf("  | Wait for input idle: %lldms\n", msToIdle);
 
-            long elapsedMs = 0;
-            while ((GetWindowLongA(hWnd, GWL_STYLE) & WS_VISIBLE) == 0 && elapsedMs < 10 * 1000)
+            long ms = 0;
+            //LONG prevStyles = 0;
+            //LONG prevExStyles = 0;
+            //while (ms < 5 * 1000)
+            //{
+            //    const LONG styles = GetWindowLongA(spResult.hWnd, GWL_STYLE);
+            //    const LONG exStyles = GetWindowLongA(spResult.hWnd, GWL_EXSTYLE);
+            //    PrintWindowStyles(styles, prevStyles, exStyles, prevExStyles);
+            //    prevStyles = styles;
+            //    prevExStyles = exStyles;
+
+            //    Sleep(250); 
+            //    ms += 250;
+            //}
+            bool validWindowStyle = false;
+            while (!validWindowStyle && ms < WINDOW_VISIBLE_TIMEOUT)
             {
                 Sleep(100);
-                elapsedMs += 100;
+                ms += 100;
+                validWindowStyle = HasFlag(GetWindowLongA(spResult.hWnd, GWL_STYLE), WS_VISIBLE) && HasFlag(GetWindowLongA(spResult.hPWnd, GWL_STYLE), WS_VISIBLE | WS_SYSMENU);
             }
 
-            //const auto delta = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() - ms.count();
-            //if (delta < 1000)
-            //    Sleep(1000 - delta);
-
-            if ((GetWindowLongA(hWnd, GWL_STYLE) & WS_VISIBLE) != 0)
+            if (validWindowStyle)
             {
-                const auto visibleTime = system_clock::now();
-                printf("[%s] The window is visible.\n", getTime(&visibleTime).c_str());
+                char localTime[32];
 
-                MoveWindow(hWnd, zero.left, zero.top, wSz.cx, wSz.cy, TRUE);
-                MoveWindow(hWnd, wPos.left, wPos.top, wSz.cx, wSz.cy, TRUE);
+                const auto visibleTime = system_clock::now();
+                GetLocalTime(&visibleTime, localTime, sizeof localTime);
+                printf("[%s] The window is visible.\n", localTime);
+
+                MoveWindow(spResult.hPWnd, zero.left, zero.top, wSz.cx, wSz.cy, TRUE);
+                MoveWindow(spResult.hPWnd, wPos.left, wPos.top, wSz.cx, wSz.cy, TRUE);
 
                 const auto doneTime = system_clock::now();
-                printf("[%s] The window has been moved.\n\n", getTime(&doneTime).c_str());
+                GetLocalTime(&doneTime, localTime, sizeof localTime);
+                printf("[%s] The window has been moved.\n\n", localTime);
+            }
+            else
+            {
+                cout << "No visible window found!" << endl;
+            }
+        }
+        else
+        {
+            cout << "Spotify main window not found!" << endl;
+        }
+    }
+}
+
+BOOL FindSpotifyMainWindow_EnumChildWindows(const HWND hWnd, const LPARAM lparam)
+{
+    if (hWnd == INVALID_HANDLE_VALUE)
+        return TRUE;
+
+    auto result = (FindSpotifyMainWindowResult* const)lparam;
+
+    WCHAR title[256], className[256];
+    GetWindowText(hWnd, title, 256);
+    GetClassName(hWnd, className, 256);
+
+    //printf("##       0x%08lX: \"%ls\" \"%ls\"\n", hWnd, className, title);
+
+    if (_wcsicmp(className, L"Chrome_RenderWidgetHostHWND") == 0)
+    {
+        result->hWnd = hWnd;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+BOOL FindSpotifyMainWindow_EnumThreadWindows(const HWND hWnd, const LPARAM lparam)
+{
+    if (hWnd == INVALID_HANDLE_VALUE)
+        return TRUE;
+
+    auto result = (FindSpotifyMainWindowResult* const)lparam;
+
+    WCHAR title[256], className[256];
+    GetWindowText(hWnd, title, 256);
+    GetClassName(hWnd, className, 256);
+
+    //printf("##    0x%08lX: \"%ls\" \"%ls\"\n", hWnd, className, title);
+
+    if (_wcsicmp(className, L"GDI+ Hook Window Class") == 0 && _wcsicmp(title, L"G") == 0)
+    {
+        result->isMainProcess = true;
+    }
+    else if (_wcsicmp(className, L"Chrome_WidgetWin_0") == 0)
+    {
+        result->isMainProcess = true;
+        if (_wcsicmp(title, L"") != 0)
+        {
+            // Enumerate child windows
+            EnumChildWindows(hWnd, FindSpotifyMainWindow_EnumChildWindows, lparam);
+            if (result->hWnd != nullptr)
+            {
+                result->hPWnd = hWnd;
+                return FALSE;
             }
         }
     }
+    return TRUE;
+}
+
+void FindSpotifyMainWindow(const DWORD processId, FindSpotifyMainWindowResult *const result)
+{
+    //printf("## Process ID: 0x%08lX\n", processId);
+    result->hPWnd = nullptr;
+    result->hWnd = nullptr;
+    result->isMainProcess = false;
+
+    const HANDLE hSnapshotThread = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, NULL);
+    if (hSnapshotThread != INVALID_HANDLE_VALUE)
+    {
+        THREADENTRY32 thread;
+        thread.dwSize = sizeof thread;
+
+        // Enumerate this process's threads
+        if (Thread32First(hSnapshotThread, &thread))
+        {
+            do
+            {
+                if (thread.th32OwnerProcessID != processId)
+                    continue;
+                if (thread.dwSize < FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof thread.th32OwnerProcessID)
+                    continue;
+
+                // Enumerate this thread's windows
+                EnumThreadWindows(thread.th32ThreadID, FindSpotifyMainWindow_EnumThreadWindows, (LPARAM)result);
+            } while (Thread32Next(hSnapshotThread, &thread));
+        }
+        CloseHandle(hSnapshotThread);
+    }
+}
+
+
+// =================
+//     FUNCTIONS
+// =================
+
+void GetLocalTime(const system_clock::time_point *const tp, char *const buffer, size_t bufferLength)
+{
+    const auto time = system_clock::to_time_t(*tp);
+    struct tm ptm;
+    localtime_s(&ptm, &time);
+
+    std::strftime(buffer, bufferLength, "%H:%M:%S", &ptm);
+    const auto ms = static_cast<unsigned>((tp->time_since_epoch() - duration_cast<seconds>(tp->time_since_epoch())) / milliseconds(1));
+    snprintf(buffer, bufferLength, "%s.%d", buffer, ms);
 }
 
 RECT GetWindowPosition(const HWND hWnd)
@@ -312,48 +453,75 @@ RECT GetWindowPosition(const HWND hWnd)
     return rect;
 }
 
-BOOL IsSpotifyMainProcess(const DWORD processId)
+void PrintWindowStyle(const LONG current, const LONG previous, LONG flag, const char* name)
 {
-    BOOL hasMainWindow = FALSE;
+    bool has = HasFlag(current, flag);
+    bool had = HasFlag(previous, flag);
 
-    // Enumerate threads
-    const HANDLE hSnapshotThread = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, NULL);
-    if (hSnapshotThread != INVALID_HANDLE_VALUE)
-    {
-        THREADENTRY32 thread;
-        thread.dwSize = sizeof thread;
+    if (has && !had)
+        printf("  + %s\n", name);
+    else if (!has && had)
+        printf("  - %s\n", name);
+}
 
-        if (Thread32First(hSnapshotThread, &thread))
-        {
-            do
-            {
-                if (thread.th32OwnerProcessID != processId)
-                    continue;
-                if (thread.dwSize < FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) + sizeof thread.th32OwnerProcessID)
-                    continue;
+void PrintWindowStyles(const LONG styles, const LONG prevStyles, const LONG exStyles, const LONG prevExStyles)
+{
+    printf("Window styles:\n");
 
-                hasMainWindow = !EnumThreadWindows(thread.th32ThreadID, [](const HWND hWnd, const LPARAM) -> BOOL
-                {
-                    if (hWnd == INVALID_HANDLE_VALUE)
-                        return true;
+    PrintWindowStyle(styles, prevStyles, WS_BORDER, "WS_BORDER");
+    PrintWindowStyle(styles, prevStyles, WS_CAPTION, "WS_CAPTION");
+    PrintWindowStyle(styles, prevStyles, WS_CHILD, "WS_CHILD");
+    PrintWindowStyle(styles, prevStyles, WS_CHILDWINDOW, "WS_CHILDWINDOW");
+    PrintWindowStyle(styles, prevStyles, WS_CLIPCHILDREN, "WS_CLIPCHILDREN");
+    PrintWindowStyle(styles, prevStyles, WS_CLIPSIBLINGS, "WS_CLIPSIBLINGS");
+    PrintWindowStyle(styles, prevStyles, WS_DISABLED, "WS_DISABLED");
+    PrintWindowStyle(styles, prevStyles, WS_DLGFRAME, "WS_DLGFRAME");
+    PrintWindowStyle(styles, prevStyles, WS_GROUP, "WS_GROUP");
+    PrintWindowStyle(styles, prevStyles, WS_HSCROLL, "WS_HSCROLL");
+    PrintWindowStyle(styles, prevStyles, WS_ICONIC, "WS_ICONIC");
+    PrintWindowStyle(styles, prevStyles, WS_MAXIMIZE, "WS_MAXIMIZE");
+    PrintWindowStyle(styles, prevStyles, WS_MAXIMIZEBOX, "WS_MAXIMIZEBOX");
+    PrintWindowStyle(styles, prevStyles, WS_MINIMIZE, "WS_MINIMIZE");
+    PrintWindowStyle(styles, prevStyles, WS_MINIMIZEBOX, "WS_MINIMIZEBOX");
+    PrintWindowStyle(styles, prevStyles, WS_OVERLAPPED, "WS_OVERLAPPED");
+    PrintWindowStyle(styles, prevStyles, WS_OVERLAPPEDWINDOW, "WS_OVERLAPPEDWINDOW");
+    PrintWindowStyle(styles, prevStyles, WS_POPUP, "WS_POPUP");
+    PrintWindowStyle(styles, prevStyles, WS_POPUPWINDOW, "WS_POPUPWINDOW");
+    PrintWindowStyle(styles, prevStyles, WS_SIZEBOX, "WS_SIZEBOX");
+    PrintWindowStyle(styles, prevStyles, WS_SYSMENU, "WS_SYSMENU");
+    PrintWindowStyle(styles, prevStyles, WS_TABSTOP, "WS_TABSTOP");
+    PrintWindowStyle(styles, prevStyles, WS_THICKFRAME, "WS_THICKFRAME");
+    PrintWindowStyle(styles, prevStyles, WS_TILED, "WS_TILED");
+    PrintWindowStyle(styles, prevStyles, WS_TABSTOP, "WS_TABSTOP");
+    PrintWindowStyle(styles, prevStyles, WS_TILEDWINDOW, "WS_TILEDWINDOW");
+    PrintWindowStyle(styles, prevStyles, WS_VISIBLE, "WS_VISIBLE");
+    PrintWindowStyle(styles, prevStyles, WS_VSCROLL, "WS_VSCROLL");
 
-                    WCHAR title[256], className[256];
-                    GetWindowText(hWnd, title, 256);
-                    GetClassName(hWnd, className, 256);
-
-                    if (_wcsicmp(className, L"Chrome_WidgetWin_0") == 0 && _wcsicmp(title, L"") != 0)
-                    {
-                        // Main window found!
-                        hSpotifyMainWindow = hWnd;
-                        return false;
-                    }
-                    return true;
-                }, NULL);
-            }
-            while (hasMainWindow == FALSE && Thread32Next(hSnapshotThread, &thread));
-        }
-        CloseHandle(hSnapshotThread);
-    }
-
-    return hasMainWindow;
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_ACCEPTFILES, "WS_EX_ACCEPTFILES");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_APPWINDOW, "WS_EX_APPWINDOW");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_CLIENTEDGE, "WS_EX_CLIENTEDGE");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_COMPOSITED, "WS_EX_COMPOSITED");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_CONTEXTHELP, "WS_EX_CONTEXTHELP");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_CONTROLPARENT, "WS_EX_CONTROLPARENT");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_DLGMODALFRAME, "WS_EX_DLGMODALFRAME");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_LAYERED, "WS_EX_LAYERED");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_LAYOUTRTL, "WS_EX_LAYOUTRTL");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_LEFT, "WS_EX_LEFT");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_LEFTSCROLLBAR, "WS_EX_LEFTSCROLLBAR");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_LTRREADING, "WS_EX_LTRREADING");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_MDICHILD, "WS_EX_MDICHILD");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_NOACTIVATE, "WS_EX_NOACTIVATE");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_NOINHERITLAYOUT, "WS_EX_NOINHERITLAYOUT");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_NOPARENTNOTIFY, "WS_EX_NOPARENTNOTIFY");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_NOREDIRECTIONBITMAP, "WS_EX_NOREDIRECTIONBITMAP");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_OVERLAPPEDWINDOW, "WS_EX_OVERLAPPEDWINDOW");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_PALETTEWINDOW, "WS_EX_PALETTEWINDOW");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_RIGHT, "WS_EX_RIGHT");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_RIGHTSCROLLBAR, "WS_EX_RIGHTSCROLLBAR");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_RTLREADING, "WS_EX_RTLREADING");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_STATICEDGE, "WS_EX_STATICEDGE");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_TOOLWINDOW, "WS_EX_TOOLWINDOW");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_TOPMOST, "WS_EX_TOPMOST");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_TRANSPARENT, "WS_EX_TRANSPARENT");
+    PrintWindowStyle(exStyles, prevExStyles, WS_EX_WINDOWEDGE, "WS_EX_WINDOWEDGE");
 }
